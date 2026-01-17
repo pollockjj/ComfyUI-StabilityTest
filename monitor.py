@@ -44,7 +44,7 @@ EVENTS_TO_LOG = {
     "execution_success": "SUCCESS",
     "execution_error": "ERROR",
     "execution_interrupted": "INTERRUPTED",
-    # "executing": "NODE_START" # Optional: enable for node-level granularity
+    "executing": "NODE",  # Node-level granularity for accurate segmentation
 }
 
 class CGPUInfo:
@@ -165,13 +165,17 @@ class CMonitor:
             
             def hooked_send_sync(instance, event, data, sid=None):
                 if event in EVENTS_TO_LOG:
-                    self.log_marker(EVENTS_TO_LOG[event])
+                    # Extract node ID for "executing" events
+                    node_id = None
+                    if event == "executing" and isinstance(data, dict):
+                        node_id = data.get("node")
+                    self.log_marker(EVENTS_TO_LOG[event], node_id=node_id)
                 return server.PromptServer.original_send_sync(instance, event, data, sid)
                 
             server.PromptServer.send_sync = hooked_send_sync
-            print("\033[34m[ComfyUI-StabilityTest] \033[0mServer Patched for Event Sync")
+            print("\033[34m[ComfyUI-StabilityTest] \033[0mServer Patched for Event Sync (Node-Level)")
 
-    def log_marker(self, marker_name):
+    def log_marker(self, marker_name, node_id=None):
         # Update State
         if marker_name == "START":
             self.workflow_counter += 1
@@ -184,13 +188,18 @@ class CMonitor:
 
         self.log_census_to_file(marker_name, census_summary)
 
-        # Log simple marker to CSV for backward compatibility
+        # Log marker to CSV with node_id if available
         if self.writer:
             with self.lock:
                 try:
                     now = datetime.datetime.now().isoformat()
+                    # Format: MARKER_NODE_123 or MARKER_START
+                    if node_id is not None:
+                        marker_str = f"MARKER_{marker_name}_{node_id}"
+                    else:
+                        marker_str = f"MARKER_{marker_name}"
                     # Use 0s to indicate marker row
-                    self.writer.writerow([now, f"MARKER_{marker_name}", 0, 0, 0, 0, 0, 0, 0, 0])
+                    self.writer.writerow([now, marker_str, 0, 0, 0, 0, 0, 0, 0, 0])
                     self.file_handle.flush()
                 except Exception as e:
                     print(f"[Monitor] Error logging marker: {e}")
