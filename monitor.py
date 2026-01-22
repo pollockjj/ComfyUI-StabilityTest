@@ -19,6 +19,9 @@ try:
 except ImportError:
     pynvml_available = False
 
+# --- Global Artifact Writer ---
+from comfy.isolation.artifact_writer import aw, aw_close_all
+
 try:
     import comfy.model_management
     COMFY_MM_AVAILABLE = True
@@ -33,6 +36,14 @@ try:
     ISOLATION_AVAILABLE = True
 except ImportError:
     ISOLATION_AVAILABLE = False
+
+try:
+    from comfy.isolation.proxies.base import IS_CHILD_PROCESS
+    from comfy.isolation.proxies.model_management_proxy import ModelManagementProxy
+    ISOLATION_PROXY_AVAILABLE = True
+except ImportError:
+    IS_CHILD_PROCESS = False
+    ISOLATION_PROXY_AVAILABLE = False
 
 # --- Configuration ---
 POLLING_RATE = 0.1 # 10Hz
@@ -141,14 +152,14 @@ class CMonitor:
     def start(self):
         if self.thread and self.thread.is_alive():
             return
-        
+
         # Initialize CSV
         is_new_file = not os.path.exists(OUTPUT_FILE)
         self.file_handle = open(OUTPUT_FILE, 'a', newline='')
         self.writer = csv.writer(self.file_handle)
-        
+
         if is_new_file:
-            self.writer.writerow(["timestamp", "event_type", "vram_used_bytes", "vram_total_bytes", "ram_used_bytes", "ram_total_bytes", "gpu_util_percent", "cpu_util_percent", "vram_host_bytes", "vram_child_bytes"])
+            self.writer.writerow(["timestamp", "event_type", "vram_used_bytes", "vram_total_bytes", "vram_host_bytes", "vram_child_bytes", "models"])
             self.file_handle.flush()
 
         self.stop_event.clear()
@@ -180,14 +191,6 @@ class CMonitor:
         if marker_name == "START":
             self.workflow_counter += 1
 
-        # Perform Tensor Census on Start/Success/Error
-        census_summary = "{}"
-        if marker_name in ["START", "SUCCESS", "ERROR", "INTERRUPTED"]:
-             # census_summary = self.perform_tensor_census()
-             pass
-
-        self.log_census_to_file(marker_name, census_summary)
-
         # Log marker to CSV with node_id if available
         if self.writer:
             with self.lock:
@@ -199,25 +202,10 @@ class CMonitor:
                     else:
                         marker_str = f"MARKER_{marker_name}"
                     # Use 0s to indicate marker row
-                    self.writer.writerow([now, marker_str, 0, 0, 0, 0, 0, 0, 0, 0])
+                    self.writer.writerow([now, marker_str, 0, 0, 0, 0, ""])
                     self.file_handle.flush()
                 except Exception as e:
                     print(f"[Monitor] Error logging marker: {e}")
-
-    def log_census_to_file(self, marker, summary):
-        log_path = os.path.join(os.path.dirname(OUTPUT_FILE), "tensor_audit.jsonl")
-        entry = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "event": marker,
-            "workflow_idx": self.workflow_counter,
-            "census": summary
-        }
-        try:
-            with open(log_path, "a") as f:
-                import json
-                f.write(json.dumps(entry) + "\n")
-        except:
-            pass
 
     def _hash_tensor(self, t):
         try:
@@ -362,34 +350,113 @@ class CMonitor:
             return {"error": str(e)}
 
     def _run(self):
+        # Cache for model change detection
+        last_models_str = ""
+        # Track model states: {id: {"name": str, "alive": bool}}
+        tracked_models = {}
+
         while not self.stop_event.is_set():
             now = datetime.datetime.now().isoformat()
-            
-            # Hardware Stats
-            cpu_util = psutil.cpu_percent(interval=None)
-            ram = psutil.virtual_memory()
-            vram_used, vram_total, gpu_util, vram_host, vram_child = self.gpu_info.get_status()
-            
+
+            # VRAM Stats only
+            vram_used, vram_total, _, vram_host, vram_child = self.gpu_info.get_status()
+
+            # Model Snapshot with lifecycle tracking
+            snapshot = self._get_models_snapshot()
+            models_str = self._format_snapshot(snapshot)
+
+            # Detect lifecycle events
+            vram_gb = vram_used / (1024 * 1024 * 1024)
+            current_ids = set()
+            for m in snapshot:
+                mid = m["id"]
+                if mid is None:
+                    continue
+                current_ids.add(mid)
+                name = m["name"]
+
+                if mid not in tracked_models:
+                    aw("lifecycle.md", f"][ stability_test_monitor - {vram_gb:05.1f}G {name}({mid % 1000:03d}) ADDED!")
+                    tracked_models[mid] = {"name": name}
+
+            # Check for GONE (removed from list entirely)
+            gone_ids = set(tracked_models.keys()) - current_ids
+            for mid in gone_ids:
+                name = tracked_models[mid]["name"]
+                aw("lifecycle.md", f"][ stability_test_monitor - {vram_gb:05.1f}G {name}({mid % 1000:03d}) GONE!")
+                del tracked_models[mid]
+
+            # Only log if models changed (reduces noise)
+            models_changed = models_str != last_models_str
+            if models_changed:
+                last_models_str = models_str
+
             with self.lock:
                 self.writer.writerow([
-                    now, 
-                    "TELEMETRY", 
-                    vram_used, 
-                    vram_total, 
-                    ram.used, 
-                    ram.total, 
-                    gpu_util, 
-                    cpu_util,
+                    now,
+                    "TELEMETRY",
+                    vram_used,
+                    vram_total,
                     vram_host,
-                    vram_child
+                    vram_child,
+                    models_str if models_changed else ""
                 ])
                 self.file_handle.flush()
 
-            # Lifecycle Telemetry
-            lifecycle_state = self.capture_lifecycle_state()
-            self.log_lifecycle_to_file(lifecycle_state)
-            
             time.sleep(POLLING_RATE)
+
+    def _get_models_snapshot(self):
+        """Get current loaded models as list of dicts."""
+        try:
+            if IS_CHILD_PROCESS and ISOLATION_PROXY_AVAILABLE:
+                # Child: RPC to Host
+                import asyncio
+                proxy = ModelManagementProxy()
+                loop = asyncio.new_event_loop()
+                try:
+                    return loop.run_until_complete(proxy.get_current_loaded_models_snapshot())
+                finally:
+                    loop.close()
+            elif COMFY_MM_AVAILABLE:
+                # Host or standard mode: direct access
+                snapshot = []
+                for i, lm in enumerate(comfy.model_management.current_loaded_models):
+                    # Filter to cuda:0 only
+                    if str(lm.device) != "cuda:0":
+                        continue
+                    if lm.model is None:
+                        snapshot.append({"index": i, "name": "DEAD", "id": None, "used": False, "mb": 0})
+                    else:
+                        name = lm.model.model.__class__.__name__ if hasattr(lm.model, 'model') else type(lm.model).__name__
+                        try:
+                            size_mb = lm.model_memory() / (1024 * 1024)
+                        except:
+                            size_mb = 0
+                        snapshot.append({
+                            "index": i,
+                            "name": name,
+                            "id": id(lm.model),
+                            "used": lm.currently_used,
+                            "mb": size_mb
+                        })
+                return snapshot
+            else:
+                return []
+        except Exception as e:
+            return []
+
+    def _format_snapshot(self, snapshot):
+        """Format snapshot list as compact string."""
+        parts = []
+        for m in snapshot:
+            used = "T" if m["used"] else "F"
+            mid = f"{m['id'] % 1000:03d}" if m["id"] else "?"
+            parts.append(f"[{m['index']}]{m['name']}({mid})[{used}][{m['mb']:.0f}]")
+        return " | ".join(parts)
+
+    def _get_models_snapshot_str(self):
+        """Get current loaded models as a compact string."""
+        return self._format_snapshot(self._get_models_snapshot())
 
     def capture_lifecycle_state(self):
         state = {
@@ -453,6 +520,7 @@ class CMonitor:
             self.thread.join()
         if self.file_handle:
             self.file_handle.close()
+        aw_close_all()
 
 _monitor_instance = CMonitor()
 
