@@ -11,6 +11,7 @@ import collections
 import inspect
 import sys
 import hashlib
+import logging
 from folder_paths import get_output_directory
 
 try:
@@ -18,9 +19,6 @@ try:
     pynvml_available = True
 except ImportError:
     pynvml_available = False
-
-# --- Global Artifact Writer ---
-from comfy.isolation.artifact_writer import aw, aw_close_all
 
 try:
     import comfy.model_management
@@ -376,14 +374,14 @@ class CMonitor:
                 name = m["name"]
 
                 if mid not in tracked_models:
-                    aw("lifecycle.md", f"][ stability_test_monitor - {vram_gb:05.1f}G {name}({mid % 1000:03d}) ADDED!")
+                    logging.info(f"][ stability_test_monitor - {vram_gb:05.1f}G {name}({mid % 1000:03d}) ADDED!")
                     tracked_models[mid] = {"name": name}
 
             # Check for GONE (removed from list entirely)
             gone_ids = set(tracked_models.keys()) - current_ids
             for mid in gone_ids:
                 name = tracked_models[mid]["name"]
-                aw("lifecycle.md", f"][ stability_test_monitor - {vram_gb:05.1f}G {name}({mid % 1000:03d}) GONE!")
+                logging.info(f"][ stability_test_monitor - {vram_gb:05.1f}G {name}({mid % 1000:03d}) GONE!")
                 del tracked_models[mid]
 
             # Only log if models changed (reduces noise)
@@ -520,7 +518,6 @@ class CMonitor:
             self.thread.join()
         if self.file_handle:
             self.file_handle.close()
-        aw_close_all()
 
 _monitor_instance = CMonitor()
 
