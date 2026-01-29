@@ -13,6 +13,7 @@ import sys
 import hashlib
 import logging
 from folder_paths import get_output_directory
+from pathlib import Path
 
 try:
     import pynvml
@@ -125,6 +126,31 @@ class CGPUInfo:
                 pass
         return vram_used, vram_total, gpu_util, vram_host, vram_child
 
+class SHMTracker:
+    """Track /dev/shm/torch_* files."""
+
+    def __init__(self):
+        self.tracked_files: set[str] = set()  # filenames currently tracked
+
+    def snapshot(self) -> set[str]:
+        """Get current torch_* files in /dev/shm."""
+        shm_path = Path("/dev/shm")
+        if not shm_path.exists():
+            return set()
+        return {f.name for f in shm_path.glob("torch_*")}
+
+    def update(self) -> tuple[set[str], set[str]]:
+        """Update tracking, return (added, removed) sets."""
+        current = self.snapshot()
+        added = current - self.tracked_files
+        removed = self.tracked_files - current
+        self.tracked_files = current
+        return added, removed
+
+    def count(self) -> int:
+        return len(self.tracked_files)
+
+
 class CMonitor:
     def __init__(self):
         self.gpu_info = CGPUInfo()
@@ -133,11 +159,14 @@ class CMonitor:
         self.file_handle = None
         self.writer = None
         self.lock = threading.Lock()
-        
+
         # Provenance Tracking
         self.workflow_counter = 0
         self.tensor_registry = {} # {id(obj): origin_workflow_idx}
-        
+
+        # SHM Tracking
+        self.shm_tracker = SHMTracker()
+
         # Lifecycle Logging
         self.lifecycle_log_path = os.path.join(get_output_directory(), "model_lifecycle.jsonl")
         # Clear previous log
@@ -374,7 +403,7 @@ class CMonitor:
                 name = m["name"]
 
                 if mid not in tracked_models:
-                    logging.info(f"][ stability_test_monitor - {vram_gb:05.1f}G {name}({mid % 1000:03d}) ADDED!")
+                    logging.debug(f"][ stability_test_monitor - {vram_gb:05.1f}G {name}({mid % 1000:03d}) ADDED!")
                     tracked_models[mid] = {"name": name}
 
             # Check for GONE (removed from list entirely)
@@ -383,6 +412,17 @@ class CMonitor:
                 name = tracked_models[mid]["name"]
                 logging.info(f"][ stability_test_monitor - {vram_gb:05.1f}G {name}({mid % 1000:03d}) GONE!")
                 del tracked_models[mid]
+
+            # SHM tracking
+            shm_added, shm_removed = self.shm_tracker.update()
+            shm_count = self.shm_tracker.count()
+            if shm_added:
+                # Log comma-separated filenames for parsing
+                added_str = ",".join(sorted(shm_added))
+                logging.info(f"][ SHM:created | +{len(shm_added)} files | total={shm_count} | files={added_str}")
+            if shm_removed:
+                removed_str = ",".join(sorted(shm_removed))
+                logging.info(f"][ SHM:deleted | -{len(shm_removed)} files | total={shm_count} | files={removed_str}")
 
             # Only log if models changed (reduces noise)
             models_changed = models_str != last_models_str
