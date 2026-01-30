@@ -129,7 +129,15 @@ class SHMTracker:
     """Track /dev/shm/torch_* files."""
 
     def __init__(self):
-        self.tracked_files: set[str] = set()  # filenames currently tracked
+        # Initialize with current state so we only report genuinely NEW files
+        self.tracked_files: set[str] = self._snapshot()
+
+    def _snapshot(self) -> set[str]:
+        """Internal snapshot (no logging)."""
+        shm_path = Path("/dev/shm")
+        if not shm_path.exists():
+            return set()
+        return {f.name for f in shm_path.glob("torch_*")}
 
     def snapshot(self) -> set[str]:
         """Get current torch_* files in /dev/shm."""
@@ -410,16 +418,12 @@ class CMonitor:
                 logging.info(f"][ stability_test_monitor - {vram_gb:05.1f}G {name}({mid % 1000:03d}) GONE!")
                 del tracked_models[mid]
 
-            # SHM tracking
+            # SHM tracking - one line per file for clean parsing
             shm_added, shm_removed = self.shm_tracker.update()
-            shm_count = self.shm_tracker.count()
-            if shm_added:
-                # Log comma-separated filenames for parsing
-                added_str = ",".join(sorted(shm_added))
-                logging.info(f"][ SHM:created | +{len(shm_added)} files | total={shm_count} | files={added_str}")
-            if shm_removed:
-                removed_str = ",".join(sorted(shm_removed))
-                logging.info(f"][ SHM:deleted | -{len(shm_removed)} files | total={shm_count} | files={removed_str}")
+            for f in sorted(shm_added):
+                logging.info(f"][ SHM:created | {f}")
+            for f in sorted(shm_removed):
+                logging.info(f"][ SHM:deleted | {f}")
 
             # Only log if models changed (reduces noise)
             models_changed = models_str != last_models_str
