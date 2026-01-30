@@ -502,7 +502,7 @@ class CMonitor:
                 real_model = model_patcher.inner_model
             else:
                 real_model = model_patcher
-            
+
             # Get first tensor from model parameters
             t = None
             if hasattr(real_model, 'parameters'):
@@ -510,25 +510,25 @@ class CMonitor:
                     if torch.is_tensor(p) and p.numel() > 0:
                         t = p
                         break
-            
+
             if t is None:
                 return "0000"
-            
+
             # Same approach as _hash_tensor: sample start/mid/end
             flat = t.flatten()
             len_t = flat.shape[0]
-            
+
             indices = [0, len_t // 2, len_t - 1]
             samples = []
             for i in indices:
                 if i < len_t:
                     samples.append(flat[i].item())
-            
+
             # Get size for uniqueness
             size = 0
             if hasattr(model_patcher, 'model_size'):
                 size = model_patcher.model_size()
-            
+
             # Hash the samples + id + size to get 4 hex chars
             sample_str = f"{samples}_{id(model_patcher):016x}_{size}"
             return hashlib.sha256(sample_str.encode()).hexdigest()[-4:]
