@@ -11,6 +11,7 @@ import collections
 import inspect
 import sys
 import logging
+import hashlib
 from folder_paths import get_output_directory
 from pathlib import Path
 
@@ -406,16 +407,18 @@ class CMonitor:
                     continue
                 current_ids.add(mid)
                 name = m["name"]
+                mhash = m.get("hash", "????") or "????"
 
                 if mid not in tracked_models:
-                    logging.debug(f"][ stability_test_monitor - {vram_gb:05.1f}G {name}({mid % 1000:03d}) ADDED!")
-                    tracked_models[mid] = {"name": name}
+                    logging.debug(f"][ stability_test_monitor - {vram_gb:05.1f}G {name}({mhash}) ADDED!")
+                    tracked_models[mid] = {"name": name, "hash": mhash}
 
             # Check for GONE (removed from list entirely)
             gone_ids = set(tracked_models.keys()) - current_ids
             for mid in gone_ids:
                 name = tracked_models[mid]["name"]
-                logging.info(f"][ stability_test_monitor - {vram_gb:05.1f}G {name}({mid % 1000:03d}) GONE!")
+                mhash = tracked_models[mid].get("hash", "????")
+                logging.info(f"][ stability_test_monitor - {vram_gb:05.1f}G {name}({mhash}) GONE!")
                 del tracked_models[mid]
 
             # SHM tracking - one line per file for clean parsing
@@ -464,19 +467,22 @@ class CMonitor:
                     if str(lm.device) != "cuda:0":
                         continue
                     if lm.model is None:
-                        snapshot.append({"index": i, "name": "DEAD", "id": None, "used": False, "mb": 0})
+                        snapshot.append({"index": i, "name": "DEAD", "id": None, "used": False, "mb": 0, "hash": None})
                     else:
                         name = lm.model.model.__class__.__name__ if hasattr(lm.model, 'model') else type(lm.model).__name__
                         try:
                             size_mb = lm.model_memory() / (1024 * 1024)
                         except:
                             size_mb = 0
+                        # Compute deterministic tensor hash
+                        model_hash = self._compute_model_hash(lm.model)
                         snapshot.append({
                             "index": i,
                             "name": name,
                             "id": id(lm.model),
                             "used": lm.currently_used,
-                            "mb": size_mb
+                            "mb": size_mb,
+                            "hash": model_hash
                         })
                 return snapshot
             else:
@@ -484,13 +490,54 @@ class CMonitor:
         except Exception:
             return []
 
+    def _compute_model_hash(self, model_patcher):
+        """Compute deterministic hash from model weights. Returns last 4 hex chars.
+        Uses same approach as _hash_tensor: sample start/mid/end positions."""
+        try:
+            # Get the actual model with weights
+            real_model = None
+            if hasattr(model_patcher, 'model'):
+                real_model = model_patcher.model
+            elif hasattr(model_patcher, 'inner_model'):
+                real_model = model_patcher.inner_model
+            else:
+                real_model = model_patcher
+            
+            # Get first tensor from model parameters
+            t = None
+            if hasattr(real_model, 'parameters'):
+                for p in real_model.parameters():
+                    if torch.is_tensor(p) and p.numel() > 0:
+                        t = p
+                        break
+            
+            if t is None:
+                return "0000"
+            
+            # Same approach as _hash_tensor: sample start/mid/end
+            flat = t.flatten()
+            len_t = flat.shape[0]
+            
+            indices = [0, len_t // 2, len_t - 1]
+            samples = []
+            for i in indices:
+                if i < len_t:
+                    samples.append(flat[i].item())
+            
+            # Hash the samples string to get 4 hex chars
+            sample_str = f"{samples}"
+            return hashlib.sha256(sample_str.encode()).hexdigest()[-4:]
+        except Exception as e:
+            logging.debug(f"[Monitor] Hash error: {e}")
+            return "err!"
+
     def _format_snapshot(self, snapshot):
         """Format snapshot list as compact string."""
         parts = []
         for m in snapshot:
             used = "T" if m["used"] else "F"
-            mid = f"{m['id'] % 1000:03d}" if m["id"] else "?"
-            parts.append(f"[{m['index']}]{m['name']}({mid})[{used}][{m['mb']:.0f}]")
+            mhash = m.get("hash", "????") or "????"
+            parts.append(f"[{m['index']}]{m['name']}({mhash})[{used}][{m['mb']:.0f}]")
         return " | ".join(parts)
 
     def _get_models_snapshot_str(self):
