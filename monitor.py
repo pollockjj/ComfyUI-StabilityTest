@@ -524,8 +524,13 @@ class CMonitor:
                 if i < len_t:
                     samples.append(flat[i].item())
             
-            # Hash the samples string to get 4 hex chars
-            sample_str = f"{samples}"
+            # Get size for uniqueness
+            size = 0
+            if hasattr(model_patcher, 'model_size'):
+                size = model_patcher.model_size()
+            
+            # Hash the samples + id + size to get 4 hex chars
+            sample_str = f"{samples}_{id(model_patcher):016x}_{size}"
             return hashlib.sha256(sample_str.encode()).hexdigest()[-4:]
         except Exception as e:
             logging.debug(f"[Monitor] Hash error: {e}")
