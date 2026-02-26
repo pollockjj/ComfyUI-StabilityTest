@@ -174,6 +174,11 @@ class CMonitor:
 
         # SHM Tracking
         self.shm_tracker = SHMTracker()
+        self.current_model_context = {
+            "id": "unknown",
+            "name": "unknown",
+            "hash": "????",
+        }
 
         # Lifecycle Logging
         self.lifecycle_log_path = os.path.join(get_output_directory(), "model_lifecycle.jsonl")
@@ -397,6 +402,7 @@ class CMonitor:
             # Model Snapshot with lifecycle tracking
             snapshot = self._get_models_snapshot()
             models_str = self._format_snapshot(snapshot)
+            self._update_current_model_context(snapshot)
 
             # Detect lifecycle events
             vram_gb = vram_used / (1024 * 1024 * 1024)
@@ -425,6 +431,16 @@ class CMonitor:
             shm_added, shm_removed = self.shm_tracker.update()
             for f in sorted(shm_added):
                 logging.info(f"][ SHM:created | {f}")
+                model_id = self.current_model_context["id"]
+                if model_id == "unknown":
+                    logging.error(
+                        f"][ SHM:model_association_missing | file={f} | reason=no_active_model_context"
+                    )
+                else:
+                    logging.info(
+                        f"][ SHM:model_association | model={model_id} | file={f} | "
+                        f"name={self.current_model_context['name']} | hash={self.current_model_context['hash']}"
+                    )
             for f in sorted(shm_removed):
                 logging.info(f"][ SHM:deleted | {f}")
 
@@ -476,19 +492,64 @@ class CMonitor:
                             size_mb = 0
                         # Compute deterministic tensor hash
                         model_hash = self._compute_model_hash(lm.model)
+                        model_instance_id = getattr(lm.model, "_instance_id", None)
+                        if model_instance_id is not None:
+                            model_instance_id = str(model_instance_id)
+                        else:
+                            model_instance_id = model_hash
                         snapshot.append({
                             "index": i,
                             "name": name,
                             "id": id(lm.model),
                             "used": lm.currently_used,
                             "mb": size_mb,
-                            "hash": model_hash
+                            "hash": model_hash,
+                            "instance_id": model_instance_id,
                         })
                 return snapshot
             else:
                 return []
         except Exception:
             return []
+
+    def _update_current_model_context(self, snapshot):
+        """Track best-effort current model context for SHM attribution."""
+        selected = None
+        used_models = [m for m in snapshot if m.get("used") and m.get("instance_id")]
+        if used_models:
+            selected = used_models[-1]
+        else:
+            live_models = [m for m in snapshot if m.get("instance_id")]
+            if live_models:
+                selected = live_models[-1]
+
+        if selected is None:
+            if self.current_model_context["id"] != "unknown":
+                self.current_model_context = {
+                    "id": "unknown",
+                    "name": "unknown",
+                    "hash": "????",
+                }
+                logging.debug("][ SHM:model_context | model=unknown | name=unknown | hash=????")
+            return
+
+        next_id = str(selected.get("instance_id", "unknown"))
+        next_name = selected.get("name", "unknown")
+        next_hash = selected.get("hash", "????") or "????"
+
+        if (
+            self.current_model_context["id"] != next_id
+            or self.current_model_context["name"] != next_name
+            or self.current_model_context["hash"] != next_hash
+        ):
+            self.current_model_context = {
+                "id": next_id,
+                "name": next_name,
+                "hash": next_hash,
+            }
+            logging.debug(
+                f"][ SHM:model_context | model={next_id} | name={next_name} | hash={next_hash}"
+            )
 
     def _compute_model_hash(self, model_patcher):
         """Compute deterministic hash from model weights. Returns last 4 hex chars.
